@@ -1,0 +1,5 @@
+# Local document rendering and review files
+/.codex-ppt-review/
+
+# PowerPoint temporary lock files
+~$*.pptx
