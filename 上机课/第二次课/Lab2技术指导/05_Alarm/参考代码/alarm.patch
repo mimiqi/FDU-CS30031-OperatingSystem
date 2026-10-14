@@ -1,0 +1,207 @@
+diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -213,7 +213,8 @@
+ ifeq ($(LAB),traps)
+ UPROGS += \
+ 	$U/_call\
+-	$U/_bttest
++	$U/_bttest\
++	$U/_alarmtest
+ endif
+ 
+ ifeq ($(LAB),lazy)
+diff --git a/kernel/defs.h b/kernel/defs.h
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -83,6 +83,7 @@
+ void            backtrace(void);
+ 
+ // proc.c
++void            alarmreset(struct proc*);
+ int             cpuid(void);
+ void            exit(int);
+ int             fork(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -126,6 +126,7 @@
+   p->sz = sz;
+   p->trapframe->epc = elf.entry;  // initial program counter = main
+   p->trapframe->sp = sp; // initial stack pointer
++  alarmreset(p); // Old handler addresses are invalid in the new image.
+   proc_freepagetable(oldpagetable, oldsz);
+ 
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+diff --git a/kernel/proc.c b/kernel/proc.c
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -89,6 +89,17 @@
+   return p;
+ }
+ 
++// Reset alarm state for a new/reused process or a newly exec'd image.
++void
++alarmreset(struct proc *p)
++{
++  p->alarm_interval = 0;
++  p->alarm_ticks = 0;
++  p->alarm_handler = 0;
++  p->alarm_active = 0;
++  memset(&p->alarm_saved, 0, sizeof(p->alarm_saved));
++}
++
+ int
+ allocpid()
+ {
+@@ -124,6 +135,7 @@
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  alarmreset(p);
+ 
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+@@ -168,6 +180,7 @@
+   p->chan = 0;
+   p->killed = 0;
+   p->xstate = 0;
++  alarmreset(p);
+   p->state = UNUSED;
+ }
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,9 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int alarm_interval;          // 0 disables delivery
++  int alarm_ticks;             // User-mode timer ticks since last delivery
++  uint64 alarm_handler;        // User virtual address; 0 can be valid
++  int alarm_active;            // Handler is running; prevent re-entry
++  struct trapframe alarm_saved; // Interrupted context, stored in kernel memory
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_sigalarm(void);
++extern uint64 sys_sigreturn(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,8 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigalarm]  sys_sigalarm,
++[SYS_sigreturn] sys_sigreturn,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sigalarm  22
++#define SYS_sigreturn 23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -5,6 +5,41 @@
+ #include "memlayout.h"
+ #include "spinlock.h"
+ #include "proc.h"
++
++uint64
++sys_sigalarm(void)
++{
++  int interval;
++  uint64 handler;
++  struct proc *p = myproc();
++
++  argint(0, &interval);
++  argaddr(1, &handler);
++  if(interval < 0)
++    return -1;
++
++  p->alarm_interval = interval;
++  p->alarm_handler = handler;
++  p->alarm_ticks = 0;
++  // Do not clear alarm_active or alarm_saved here: a handler may disable
++  // further alarms before calling sigreturn() to restore its context.
++  return 0;
++}
++
++uint64
++sys_sigreturn(void)
++{
++  struct proc *p = myproc();
++  if(!p->alarm_active)
++    return -1;
++
++  uint64 saved_a0 = p->alarm_saved.a0;
++  *p->trapframe = p->alarm_saved;
++  p->alarm_active = 0;
++  p->alarm_ticks = 0;
++  // syscall() writes this return value to a0, so preserve the original a0.
++  return saved_a0;
++}
+ 
+ uint64
+ sys_exit(void)
+diff --git a/kernel/trap.c b/kernel/trap.c
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -76,9 +76,20 @@
+   if(killed(p))
+     exit(-1);
+ 
+-  // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
++  // Count only timer interrupts that interrupted user-mode execution.
++  if(which_dev == 2){
++    if(p->alarm_interval > 0 && !p->alarm_active){
++      p->alarm_ticks++;
++      if(p->alarm_ticks >= p->alarm_interval){
++        p->alarm_saved = *p->trapframe;
++        p->alarm_active = 1;
++        p->alarm_ticks = 0;
++        p->trapframe->epc = p->alarm_handler;
++      }
++    }
++    // Preserve the original timer-driven scheduling behavior.
+     yield();
++  }
+ 
+   usertrapret();
+ }
+diff --git a/user/user.h b/user/user.h
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,8 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int sigalarm(int ticks, void (*handler)(void));
++int sigreturn(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sigalarm");
++entry("sigreturn");
