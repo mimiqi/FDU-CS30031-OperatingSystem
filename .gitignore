@@ -1,5 +1,8 @@
 # Local document rendering and review files
 /.codex-ppt-review/
 
+# Automatically downloaded chat attachments (report assets are stored separately)
+/.codex-remote-attachments/
+
 # PowerPoint temporary lock files
 ~$*.pptx

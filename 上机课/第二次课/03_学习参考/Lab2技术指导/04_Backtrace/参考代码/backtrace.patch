@@ -1,0 +1,81 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index d1b6bb9..29f5a76 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -80,6 +80,7 @@ int             pipewrite(struct pipe*, uint64, int);
+ int            printf(char*, ...) __attribute__ ((format (printf, 1, 2)));
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
++void            backtrace(void);
+ 
+ // proc.c
+ int             cpuid(void);
+diff --git a/kernel/printf.c b/kernel/printf.c
+index d20534c..25abe43 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -159,12 +159,33 @@ printf(char *fmt, ...)
+   return 0;
+ }
+ 
++void
++backtrace(void)
++{
++  uint64 fp = r_fp();
++  // Locate the stack page, but exclude its topmost trap frame below.
++  uint64 low = PGROUNDDOWN(fp - 1);
++  uint64 high = low + PGSIZE;
++
++  printf("backtrace:\n");
++  while(fp >= low + 16 && fp < high && (fp & 15) == 0){
++    uint64 ra = *(uint64 *)(fp - 8);
++    uint64 previous = *(uint64 *)(fp - 16);
++    printf("%p\n", (void *)ra);
++    // The stack grows down: callers must have a strictly larger fp.
++    if(previous <= fp || previous >= high)
++      break;
++    fp = previous;
++  }
++}
++
+ void
+ panic(char *s)
+ {
+   pr.locking = 0;
+   printf("panic: ");
+   printf("%s\n", s);
++  backtrace();
+   panicked = 1; // freeze uart output from other CPUs
+   for(;;)
+     ;
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index f7aaa8a..23c76d5 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -330,6 +330,14 @@ w_tp(uint64 x)
+   asm volatile("mv tp, %0" : : "r" (x));
+ }
+ 
++static inline uint64
++r_fp()
++{
++  uint64 x;
++  asm volatile("mv %0, s0" : "=r" (x));
++  return x;
++}
++
+ static inline uint64
+ r_ra()
+ {
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..fe64ad3 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -57,6 +57,7 @@ sys_sleep(void)
+   argint(0, &n);
+   if(n < 0)
+     n = 0;
++  backtrace();
+   acquire(&tickslock);
+   ticks0 = ticks;
+   while(ticks - ticks0 < n){
